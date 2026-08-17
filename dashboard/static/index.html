@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Review Radar — Swarm</title>
+<style>
+  :root {
+    --background: #1a1206; --foreground: #faf0d7;
+    --surface: #2d2111; --surface-2: #3d2f17;
+    --border: #6b5530; --primary: #d4940a; --primary-light: #e8b230;
+    --success: #a0d911; --warning: #e8a317; --error: #ff5252;
+    --muted: #b89d6a; --honey: #e8a317; --honey-glow: rgba(232,163,23,.22);
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--background); color: var(--foreground);
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    min-height: 100vh; overflow-x: hidden;
+  }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #6b5530; border-radius: 3px; }
+
+  .honeycomb-bg {
+    position: fixed; inset: 0; z-index: 0; pointer-events: none;
+    background-image:
+      linear-gradient(30deg, rgba(212,148,10,.07) 12%, transparent 12.5%, transparent 87%, rgba(212,148,10,.07) 87.5%, rgba(212,148,10,.07)),
+      linear-gradient(150deg, rgba(212,148,10,.07) 12%, transparent 12.5%, transparent 87%, rgba(212,148,10,.07) 87.5%, rgba(212,148,10,.07)),
+      linear-gradient(30deg, rgba(212,148,10,.07) 12%, transparent 12.5%, transparent 87%, rgba(212,148,10,.07) 87.5%, rgba(212,148,10,.07)),
+      linear-gradient(150deg, rgba(212,148,10,.07) 12%, transparent 12.5%, transparent 87%, rgba(212,148,10,.07) 87.5%, rgba(212,148,10,.07)),
+      linear-gradient(60deg, rgba(200,150,44,.08) 25%, transparent 25.5%, transparent 75%, rgba(200,150,44,.08) 75%, rgba(200,150,44,.08)),
+      linear-gradient(60deg, rgba(200,150,44,.08) 25%, transparent 25.5%, transparent 75%, rgba(200,150,44,.08) 75%, rgba(200,150,44,.08));
+    background-size: 40px 70px;
+    background-position: 0 0, 0 0, 20px 35px, 20px 35px, 0 0, 20px 35px;
+  }
+  .spotlight {
+    position: fixed; inset: 0; z-index: 0; pointer-events: none;
+    background:
+      radial-gradient(circle at 50% 35%, rgba(232,163,23,.14) 0%, rgba(212,148,10,.08) 20%, transparent 55%),
+      radial-gradient(ellipse 70% 70% at 50% 50%, transparent 0%, rgba(26,18,6,.3) 70%, rgba(26,18,6,.6) 100%);
+  }
+  .honey-particle {
+    position: fixed; bottom: 12vh; border-radius: 50%; pointer-events: none; z-index: 0;
+    background: radial-gradient(circle, rgba(232,163,23,.85), rgba(212,148,10,.35));
+    box-shadow: 0 0 5px 2px rgba(232,163,23,.25);
+  }
+  @keyframes float-up { 0% { transform: translateY(0) scale(1); opacity: 0; } 10% { opacity: .7; } 70% { opacity: .3; } 100% { transform: translateY(-260px) translateX(35px) scale(.25); opacity: 0; } }
+  .honey-particle:nth-child(odd)  { width: 4px; height: 4px; animation: float-up 5s ease-in-out infinite; }
+  .honey-particle:nth-child(even) { width: 6px; height: 6px; animation: float-up 6.5s 1.2s ease-in-out infinite; }
+
+  .wrap { position: relative; z-index: 1; max-width: 1180px; margin: 0 auto; padding: 28px 24px 80px; }
+
+  /* Header */
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 20px; }
+  .hex-logo {
+    width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center;
+    clip-path: polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%);
+    background: linear-gradient(135deg, #d4940a, #e8b230); color: #1a1206; font-size: 20px;
+    animation: honey-glow 1.8s ease-in-out infinite;
+  }
+  h1 {
+    font-size: 26px; letter-spacing: .06em; font-weight: 800;
+    background: linear-gradient(135deg, #d4940a, #e8b230, #e8a317, #c8962c, #e8b230);
+    background-size: 300% 300%; -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent; animation: shimmer 2.5s ease-in-out infinite;
+  }
+  @keyframes shimmer { 0%,100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+  .glass {
+    background: rgba(45,33,17,.78); backdrop-filter: blur(20px) saturate(1.4);
+    border: 1px solid rgba(200,150,44,.18); border-radius: 16px;
+    box-shadow: 0 8px 32px rgba(0,0,0,.35), inset 0 1px 0 rgba(232,178,48,.08);
+  }
+
+  /* Controls */
+  .controls { display: flex; gap: 10px; padding: 14px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+  .controls input[type=text] {
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--foreground);
+    border-radius: 10px; padding: 10px 12px; font-size: 13px; outline: none; transition: border-color .3s;
+  }
+  .controls input[type=text]:focus { border-color: var(--primary-light); }
+  #product { flex: 1 1 200px; } #friends { flex: 2 1 280px; }
+  .demo-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; }
+  button.deploy {
+    background: linear-gradient(135deg, #d4940a, #e8b230); color: #1a1206; font-weight: 800;
+    border: none; border-radius: 10px; padding: 10px 18px; font-size: 13px; letter-spacing: .04em;
+    cursor: pointer; transition: transform .15s, box-shadow .3s;
+  }
+  button.deploy:hover { transform: translateY(-1px); box-shadow: 0 0 24px rgba(232,163,23,.4); }
+  button.deploy:disabled { opacity: .5; cursor: default; transform: none; }
+
+  /* Stats bar */
+  .stats { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-bottom: 16px; }
+  .stat { padding: 10px 14px; text-align: center; }
+  .stat .num { font-size: 20px; font-weight: 800; color: var(--primary-light); font-variant-numeric: tabular-nums; }
+  .stat .lbl { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-top: 2px; }
+  .stat.match .num { color: var(--success); }
+
+  /* Agent grid */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    padding: 14px; cursor: pointer; min-height: 128px; display: flex; flex-direction: column; gap: 8px;
+    transition: box-shadow .4s, border-color .4s, transform .2s; position: relative;
+  }
+  .card:hover { box-shadow: 0 0 30px rgba(212,148,10,.15); border-color: rgba(212,148,10,.5); transform: translateY(-2px); }
+  .card.running { animation: honey-glow 1.8s ease-in-out infinite, waggle 1.8s ease-in-out infinite; border-color: rgba(232,163,23,.5); }
+  .card.selected { border-color: var(--primary-light); box-shadow: 0 0 24px 4px rgba(232,163,23,.25); }
+  @keyframes honey-glow {
+    0%,100% { box-shadow: 0 0 8px 2px rgba(232,163,23,.4), 0 0 0 0 rgba(232,163,23,.2); }
+    50% { box-shadow: 0 0 20px 8px rgba(232,163,23,.2), 0 0 30px 12px rgba(212,148,10,.08); }
+  }
+  @keyframes waggle {
+    0%,50%,100% { transform: translate(0,0) rotate(0); }
+    10% { transform: translate(-1.5px,.8px) rotate(-.6deg); } 20% { transform: translate(1.5px,-.8px) rotate(.6deg); }
+    30% { transform: translate(-.8px,1.5px) rotate(-.4deg); } 40% { transform: translate(.8px,-1.5px) rotate(.4deg); }
+  }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .site { font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .hex-dot {
+    width: 14px; height: 14px; flex-shrink: 0;
+    clip-path: polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%);
+    background: var(--muted);
+  }
+  .card.running .hex-dot { background: var(--primary-light); animation: pulse 1.5s ease-in-out infinite; }
+  .card.completed .hex-dot { background: var(--success); }
+  .card.failed .hex-dot { background: var(--error); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .badge {
+    font-size: 10px; font-weight: 800; padding: 2px 8px; border-radius: 999px;
+    background: var(--honey-glow); color: var(--primary-light); white-space: nowrap;
+  }
+  .badge.match { background: rgba(160,217,17,.15); color: var(--success); }
+  .badge.blocked { background: rgba(255,82,82,.15); color: var(--error); }
+
+  .chips { display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }
+  .chip {
+    font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 8px;
+    background: var(--surface-2); color: var(--muted); display: inline-flex; align-items: center; gap: 4px;
+  }
+  .chip.completed { background: rgba(160,217,17,.15); color: var(--success); }
+  .chip.failed { background: rgba(255,82,82,.15); color: var(--error); }
+  .chip.running { background: var(--honey-glow); color: var(--primary-light); animation: pulse 1.5s ease-in-out infinite; }
+  .conn { width: 8px; height: 1px; background: var(--border); }
+
+  .meta { font-size: 11px; color: var(--muted); margin-top: auto; line-height: 1.5; }
+  .meta .err { color: var(--error); }
+  .spinner {
+    width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0;
+    border: 2px solid var(--primary); border-top-color: transparent; animation: spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .empty { text-align: center; color: var(--muted); padding: 70px 20px; font-size: 14px; }
+  .empty .hex-logo { animation: none; opacity: .35; margin-bottom: 12px; }
+
+  /* Detail drawer */
+  .drawer {
+    position: fixed; top: 0; right: -480px; width: 460px; max-width: 92vw; height: 100vh; z-index: 20;
+    padding: 22px; overflow-y: auto; transition: right .35s cubic-bezier(.4,0,.2,1);
+    border-radius: 16px 0 0 16px; border-right: none;
+  }
+  .drawer.open { right: 0; }
+  .drawer h2 { font-size: 18px; display: flex; align-items: center; gap: 10px; }
+  .drawer .close {
+    position: absolute; top: 16px; right: 16px; background: none; border: none;
+    color: var(--muted); font-size: 20px; cursor: pointer;
+  }
+  .drawer .close:hover { color: var(--foreground); }
+  .drawer h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); margin: 18px 0 8px; }
+  .logbox {
+    background: rgba(26,18,6,.6); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.7;
+    max-height: 180px; overflow-y: auto; word-break: break-all;
+  }
+  .logbox .t { color: var(--primary); margin-right: 8px; }
+  .review {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; margin-bottom: 8px; font-size: 12px;
+  }
+  .review.friend { border-color: var(--success); box-shadow: 0 0 12px rgba(160,217,17,.15); }
+  .review .who { font-weight: 700; display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .review .stars { color: var(--warning); letter-spacing: 1px; }
+  .review p { color: var(--muted); line-height: 1.5; }
+  .fbadge {
+    font-size: 9px; font-weight: 800; padding: 1px 7px; border-radius: 999px;
+    background: var(--success); color: #1a1206; text-transform: uppercase;
+  }
+  .drawer a { color: var(--primary-light); word-break: break-all; font-size: 11px; }
+  .overlay { position: fixed; inset: 0; z-index: 15; background: rgba(26,18,6,.5); opacity: 0; pointer-events: none; transition: opacity .3s; }
+  .overlay.show { opacity: 1; pointer-events: auto; }
+</style>
+</head>
+<body>
+<div class="honeycomb-bg"></div>
+<div class="spotlight"></div>
+<div class="wrap">
+  <header>
+    <div class="hex-logo">⬡</div>
+    <div>
+      <h1>REVIEW RADAR</h1>
+      <div class="sub">swarm intelligence for reviews that actually matter to you</div>
+    </div>
+  </header>
+
+  <div class="glass controls">
+    <input id="product" type="text" placeholder="Product to hunt (e.g. echo dot)" value="echo dot">
+    <input id="friends" type="text" placeholder="Friends, comma-separated (e.g. Charlie, Aarsh)">
+    <label class="demo-toggle"><input id="demo" type="checkbox" checked> demo mode</label>
+    <button class="deploy" id="deploy">DEPLOY SWARM</button>
+  </div>
+
+  <div class="stats">
+    <div class="glass stat"><div class="num" id="s-total">0</div><div class="lbl">Agents</div></div>
+    <div class="glass stat"><div class="num" id="s-running">0</div><div class="lbl">Running</div></div>
+    <div class="glass stat"><div class="num" id="s-completed">0</div><div class="lbl">Done</div></div>
+    <div class="glass stat"><div class="num" id="s-failed">0</div><div class="lbl">Failed</div></div>
+    <div class="glass stat"><div class="num" id="s-reviews">0</div><div class="lbl">Reviews</div></div>
+    <div class="glass stat match"><div class="num" id="s-matches">0</div><div class="lbl">Friend hits</div></div>
+  </div>
+
+  <div class="grid" id="grid">
+    <div class="empty" id="empty" style="grid-column: 1/-1;">
+      <div class="hex-logo">⬡</div><br>
+      The hive is quiet. Deploy the swarm to send one worker per store.
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="overlay"></div>
+<aside class="glass drawer" id="drawer"></aside>
+
+<script>
+const STEPS = ["search", "locate", "parse", "match"];
+const STEP_LABELS = { search: "Search", locate: "Locate", parse: "Parse", match: "Match" };
+const agents = new Map();
+let selectedId = null;
+
+// ambient particles
+for (let i = 0; i < 14; i++) {
+  const p = document.createElement("div");
+  p.className = "honey-particle";
+  p.style.left = (4 + Math.random() * 92) + "vw";
+  p.style.animationDelay = (Math.random() * 6) + "s";
+  document.body.appendChild(p);
+}
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+function chipHtml(a) {
+  return STEPS.map((s, i) => {
+    const st = a.steps[s] || "pending";
+    const dot = st === "running" ? '<span class="spinner" style="width:8px;height:8px;border-width:1.5px"></span>' : "";
+    return (i ? '<span class="conn"></span>' : "") +
+      `<span class="chip ${st}">${dot}${STEP_LABELS[s]}</span>`;
+  }).join("");
+}
+
+function cardHtml(a) {
+  const badges = [];
+  if (a.matches > 0) badges.push(`<span class="badge match">${a.matches} friend${a.matches > 1 ? "s" : ""}</span>`);
+  if (a.blocked) badges.push('<span class="badge blocked">blocked</span>');
+  else if (a.status === "queued") badges.push('<span class="badge">queued</span>');
+  const meta = a.error
+    ? `<span class="err">${esc(a.error)}</span>`
+    : a.reviews.length ? `${a.reviews.length} reviews scanned` :
+      a.status === "running" ? "working…" : "&nbsp;";
+  return `
+    <div class="card-head">
+      <span class="site"><span class="hex-dot"></span>${esc(a.site)}</span>
+      <span style="display:flex;gap:5px;align-items:center">${badges.join("")}
+      ${a.status === "running" ? '<span class="spinner"></span>' : ""}</span>
+    </div>
+    <div class="chips">${chipHtml(a)}</div>
+    <div class="meta">${meta}</div>`;
+}
+
+function upsertCard(a) {
+  agents.set(a.id, a);
+  $("empty")?.remove();
+  let el = document.getElementById("card-" + a.id);
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "card-" + a.id;
+    el.addEventListener("click", () => openDrawer(a.id));
+    $("grid").appendChild(el);
+  }
+  el.className = "card " + a.status + (selectedId === a.id ? " selected" : "");
+  el.innerHTML = cardHtml(a);
+  if (selectedId === a.id) renderDrawer(a);
+}
+
+function stars(r) { return r ? "★".repeat(Math.round(+r)) + "☆".repeat(Math.max(0, 5 - Math.round(+r))) : ""; }
+
+function renderDrawer(a) {
+  $("drawer").innerHTML = `
+    <button class="close" id="close-btn">✕</button>
+    <h2><span class="hex-dot" style="width:18px;height:18px"></span>${esc(a.site)} agent</h2>
+    <div class="chips" style="margin-top:10px">${chipHtml(a)}</div>
+    ${a.product_url ? `<h3>Product page</h3><a href="${esc(a.product_url)}" target="_blank" rel="noreferrer">${esc(a.product_url)}</a>` : ""}
+    <h3>Activity log</h3>
+    <div class="logbox">${a.log.map(l => `<div><span class="t">${l.t.toFixed(1)}s</span>${esc(l.msg)}</div>`).join("") || "no activity yet"}</div>
+    <h3>Reviews (${a.reviews.length})${a.matches ? ` — ${a.matches} from friends` : ""}</h3>
+    ${a.reviews.map(r => `
+      <div class="review ${r.friend ? "friend" : ""}">
+        <div class="who">${esc(r.author)} ${r.friend ? '<span class="fbadge">friend</span>' : ""}
+          <span class="stars">${stars(r.rating)}</span></div>
+        <p>${esc(r.text)}</p>
+      </div>`).join("") || '<p style="color:var(--muted);font-size:12px">nothing parsed yet</p>'}`;
+  document.getElementById("close-btn").addEventListener("click", closeDrawer);
+}
+
+function openDrawer(id) {
+  selectedId = id;
+  document.querySelectorAll(".card").forEach(c => c.classList.toggle("selected", c.id === "card-" + id));
+  renderDrawer(agents.get(id));
+  $("drawer").classList.add("open");
+  $("overlay").classList.add("show");
+}
+function closeDrawer() {
+  selectedId = null;
+  document.querySelectorAll(".card.selected").forEach(c => c.classList.remove("selected"));
+  $("drawer").classList.remove("open");
+  $("overlay").classList.remove("show");
+}
+$("overlay").addEventListener("click", closeDrawer);
+
+function setStats(s) {
+  if (!s) return;
+  for (const k of ["total", "running", "completed", "failed", "reviews", "matches"])
+    $("s-" + k).textContent = s[k] ?? 0;
+}
+function recount() {
+  const vals = [...agents.values()];
+  setStats({
+    total: vals.length,
+    running: vals.filter(a => a.status === "running").length,
+    completed: vals.filter(a => a.status === "completed").length,
+    failed: vals.filter(a => a.status === "failed").length,
+    reviews: vals.reduce((n, a) => n + a.reviews.length, 0),
+    matches: vals.reduce((n, a) => n + (a.matches || 0), 0),
+  });
+}
+
+const es = new EventSource("/api/events");
+es.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+  if (msg.type === "hello" || msg.type === "run") {
+    if (msg.type === "run") { agents.clear(); $("grid").innerHTML = ""; closeDrawer(); }
+    (msg.agents || []).forEach(upsertCard);
+    setStats(msg.stats);
+  } else if (msg.type === "agent") {
+    upsertCard(msg.agent);
+    recount();
+  } else if (msg.type === "stats") {
+    setStats(msg.stats);
+  }
+};
+
+$("deploy").addEventListener("click", async () => {
+  const product = $("product").value.trim();
+  if (!product) return;
+  $("deploy").disabled = true;
+  try {
+    await fetch("/api/runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        product,
+        friends: $("friends").value.split(",").map(s => s.trim()).filter(Boolean),
+        demo: $("demo").checked,
+      }),
+    });
+  } finally {
+    setTimeout(() => { $("deploy").disabled = false; }, 1500);
+  }
+});
+</script>
+</body>
+</html>

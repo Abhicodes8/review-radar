@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Review Radar",
+  "version": "0.1.0",
+  "description": "Highlights Amazon reviews written by your friends.",
+  "content_scripts": [
+    {
+      "matches": ["https://www.amazon.com/*"],
+      "js": ["friends.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
