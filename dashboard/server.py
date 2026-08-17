@@ -1,8 +1,14 @@
 """Review Radar Swarm — orchestrator + worker agents + SSE dashboard.
 
-One async worker agent per retail site. Each agent: search the site for the
-product -> pick a product page -> parse JSON-LD reviews -> match friend list.
-Sites that block non-browser clients are reported honestly as "blocked".
+One async worker agent per retail site. Pipeline per agent:
+  search the site -> locate a product page -> extract reviews -> match friends
+  -> (optional) score interest similarity with Claude.
+
+Fetching uses a real headless browser (Playwright/Chromium) when installed,
+falling back to plain HTTP. Review extraction uses structured JSON-LD data
+when present, falling back to Claude reading the page text (needs
+ANTHROPIC_API_KEY in dashboard/.env). Sites that still block are reported
+honestly as "blocked" — we don't evade bot detection.
 """
 
 import asyncio
@@ -14,16 +20,32 @@ import urllib.parse
 from pathlib import Path
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+import os
+
+load_dotenv(Path(__file__).parent / ".env")
+
+try:
+    from playwright.async_api import async_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+claude = None
+if ANTHROPIC_KEY:
+    import anthropic
+    claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+
+CLAUDE_MODEL = "claude-opus-5"
+
 app = FastAPI(title="Review Radar Swarm")
-
 STATIC = Path(__file__).parent / "static"
-
-# Honest client identity: we don't impersonate a browser or evade blocks.
-HEADERS = {"User-Agent": "ReviewRadar/0.1 (personal review-research tool)"}
+HEADERS = {"User-Agent": "ReviewRadar/0.2 (personal review-research tool)"}
 
 SITES = [
     {"id": "amazon",    "name": "Amazon",     "search": "https://www.amazon.com/s?k={q}",                    "link": r"/dp/[A-Z0-9]{10}"},
@@ -32,7 +54,7 @@ SITES = [
     {"id": "target",    "name": "Target",     "search": "https://www.target.com/s?searchTerm={q}",           "link": r"/p/[^\"'\s]+/-/A-\d+"},
     {"id": "ebay",      "name": "eBay",       "search": "https://www.ebay.com/sch/i.html?_nkw={q}",          "link": r"/itm/\d+"},
     {"id": "etsy",      "name": "Etsy",       "search": "https://www.etsy.com/search?q={q}",                 "link": r"/listing/\d+[^\"'\s]*"},
-    {"id": "newegg",    "name": "Newegg",     "search": "https://www.newegg.com/p/pl?d={q}",                 "link": r"/p/[A-Za-z0-9-]+"},
+    {"id": "newegg",    "name": "Newegg",     "search": "https://www.newegg.com/p/pl?d={q}",                 "link": r"/p/[A-Z0-9-]+\?"},
     {"id": "homedepot", "name": "Home Depot", "search": "https://www.homedepot.com/s/{q}",                   "link": r"/p/[^\"'\s]+/\d+"},
     {"id": "wayfair",   "name": "Wayfair",    "search": "https://www.wayfair.com/keyword.php?keyword={q}",   "link": r"/pdp/[^\"'\s]+\.html"},
     {"id": "rei",       "name": "REI",        "search": "https://www.rei.com/search?q={q}",                  "link": r"/product/\d+[^\"'\s]*"},
@@ -68,8 +90,21 @@ class Bus:
 
 
 bus = Bus()
-agents: dict[str, dict] = {}  # id -> agent state (current run only)
+agents: dict[str, dict] = {}
 run_info: dict = {}
+
+# Headless browser contexts are memory-hungry; keep a small concurrency cap.
+browser_sem = asyncio.Semaphore(3)
+_pw = None
+_browser = None
+
+
+async def get_browser():
+    global _pw, _browser
+    if _browser is None:
+        _pw = await async_playwright().start()
+        _browser = await _pw.chromium.launch(headless=True)
+    return _browser
 
 
 def emit_agent(agent: dict):
@@ -86,6 +121,49 @@ def set_step(agent: dict, step: str, status: str):
     emit_agent(agent)
 
 
+# ── Fetching ─────────────────────────────────────────────────────────────────
+
+BLOCK_MARKERS = ["captcha", "robot or human", "access denied", "are you a human",
+                 "unusual traffic", "verify you are"]
+
+
+def looks_blocked(text: str) -> bool:
+    head = text[:8000].lower()
+    return any(m in head for m in BLOCK_MARKERS)
+
+
+async def fetch_page(agent: dict, url: str) -> dict:
+    """Fetch a page, preferring a real browser. Returns
+    {html, text, url, status, blocked} or raises on hard failure."""
+    if HAS_PLAYWRIGHT:
+        async with browser_sem:
+            browser = await get_browser()
+            ctx = await browser.new_context(viewport={"width": 1280, "height": 900})
+            try:
+                page = await ctx.new_page()
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(2500)  # let reviews hydrate
+                html = await page.content()
+                try:
+                    text = await page.inner_text("body")
+                except Exception:
+                    text = ""
+                status = resp.status if resp else 0
+                final_url = page.url
+            finally:
+                await ctx.close()
+        log(agent, f"chromium GET {url} → {status}, {len(html) // 1000}kB")
+        return {"html": html, "text": text, "url": final_url, "status": status,
+                "blocked": status in (403, 429, 503) or looks_blocked(html)}
+
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=20) as client:
+        resp = await client.get(url)
+    log(agent, f"GET {url} → {resp.status_code}, {len(resp.text) // 1000}kB")
+    return {"html": resp.text, "text": resp.text, "url": str(resp.url),
+            "status": resp.status_code,
+            "blocked": resp.status_code in (403, 429, 503) or looks_blocked(resp.text)}
+
+
 # ── Friend matching ──────────────────────────────────────────────────────────
 
 def normalize(name: str) -> str:
@@ -98,13 +176,12 @@ def is_friend(name: str, friends: list[str]) -> bool:
         fn = normalize(f)
         if n == fn:
             return True
-        # "Charlie" matches "Charlie K." but not "Charlotte"
         if fn and (n.startswith(fn + " ") or fn.startswith(n + " ")):
             return True
     return False
 
 
-# ── Review extraction (JSON-LD) ──────────────────────────────────────────────
+# ── Review extraction: JSON-LD, then Claude ──────────────────────────────────
 
 def _collect_reviews(node, out: list):
     if isinstance(node, dict):
@@ -131,7 +208,7 @@ def _collect_reviews(node, out: list):
             _collect_reviews(v, out)
 
 
-def extract_reviews(html: str) -> list[dict]:
+def extract_jsonld_reviews(html: str) -> list[dict]:
     out: list[dict] = []
     for m in re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', html, re.S):
         try:
@@ -141,20 +218,122 @@ def extract_reviews(html: str) -> list[dict]:
     return out
 
 
+REVIEWS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reviews": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "author": {"type": "string"},
+                    "rating": {"type": ["integer", "null"]},
+                    "text": {"type": "string"},
+                },
+                "required": ["author", "rating", "text"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["reviews"],
+    "additionalProperties": False,
+}
+
+
+async def claude_extract_reviews(agent: dict, page_text: str) -> list[dict]:
+    log(agent, "asking Claude to extract reviews from page text")
+    resp = await claude.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=4096,
+        output_config={"format": {"type": "json_schema", "schema": REVIEWS_SCHEMA}},
+        messages=[{
+            "role": "user",
+            "content": (
+                "Below is the visible text of a retail product page. Extract every "
+                "customer review you can find. For each, give the reviewer's display "
+                "name, star rating (1-5, or null if not shown), and the review text "
+                "(trim to ~300 chars). If there are no reviews, return an empty list.\n\n"
+                + page_text[:30000]
+            ),
+        }],
+    )
+    if resp.stop_reason == "refusal":
+        log(agent, "Claude declined the extraction request")
+        return []
+    text = next((b.text for b in resp.content if b.type == "text"), "{}")
+    return json.loads(text).get("reviews", [])[:25]
+
+
+SIMILARITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scores": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "similarity": {"type": "integer"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["index", "similarity", "reason"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["scores"],
+    "additionalProperties": False,
+}
+
+
+async def claude_score_similarity(agent: dict, reviews: list[dict], interests: str):
+    """Score how much each reviewer seems to share the user's interests (0-100)."""
+    listing = "\n".join(
+        f"{i}. {r['author']}: {r['text'][:200]}" for i, r in enumerate(reviews)
+    )
+    resp = await claude.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=4096,
+        output_config={"format": {"type": "json_schema", "schema": SIMILARITY_SCHEMA}},
+        messages=[{
+            "role": "user",
+            "content": (
+                "My interests and priorities as a shopper:\n"
+                f"{interests}\n\n"
+                "Below are product reviews, one per line, prefixed with an index. "
+                "For each review, judge from its content how much this reviewer seems "
+                "to share my interests/priorities (similarity 0-100) and give a short "
+                "reason (max 12 words). Score every index.\n\n" + listing
+            ),
+        }],
+    )
+    if resp.stop_reason == "refusal":
+        log(agent, "Claude declined the similarity request")
+        return
+    text = next((b.text for b in resp.content if b.type == "text"), "{}")
+    for s in json.loads(text).get("scores", []):
+        i = s.get("index")
+        if isinstance(i, int) and 0 <= i < len(reviews):
+            reviews[i]["similarity"] = max(0, min(100, s["similarity"]))
+            reviews[i]["sim_reason"] = s["reason"]
+    n = sum(1 for r in reviews if r.get("similarity", 0) >= 70)
+    log(agent, f"Claude scored similarity: {n} kindred reviewer(s)")
+
+
 # ── Worker agent ─────────────────────────────────────────────────────────────
 
-async def run_agent(site: dict, query: str, friends: list[str], demo: bool):
+async def run_agent(site: dict, query: str, friends: list[str], interests: str, demo: bool):
     agent = agents[site["id"]]
     agent["status"] = "running"
     agent["t0"] = time.time()
-    log(agent, f"deployed → {site['name']}")
+    log(agent, f"deployed → {site['name']}" + (" (chromium)" if HAS_PLAYWRIGHT and not demo else ""))
     emit_agent(agent)
 
     try:
         if demo:
-            await demo_agent(agent, site, friends)
+            await demo_agent(agent, site, friends, interests)
         else:
-            await live_agent(agent, site, query, friends)
+            await live_agent(agent, site, query, friends, interests)
         agent["status"] = "failed" if agent.get("error") else "completed"
     except Exception as e:  # keep the swarm alive if one worker dies
         agent["error"] = str(e)[:200]
@@ -165,71 +344,74 @@ async def run_agent(site: dict, query: str, friends: list[str], demo: bool):
     bus.publish({"type": "stats", "stats": compute_stats()})
 
 
-async def live_agent(agent: dict, site: dict, query: str, friends: list[str]):
+async def live_agent(agent: dict, site: dict, query: str, friends: list[str], interests: str):
     q = urllib.parse.quote_plus(query)
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=15) as client:
-        # 1. search
-        set_step(agent, "search", "running")
-        url = site["search"].format(q=q)
-        log(agent, f"GET {url}")
-        try:
-            resp = await client.get(url)
-        except httpx.HTTPError as e:
-            agent["error"] = f"network error: {e.__class__.__name__}"
-            set_step(agent, "search", "failed")
-            return
-        log(agent, f"HTTP {resp.status_code}, {len(resp.text) // 1000}kB")
-        if resp.status_code in (403, 429, 503) or "captcha" in resp.text[:5000].lower():
-            agent["error"] = f"blocked by {site['name']} (HTTP {resp.status_code})"
-            agent["blocked"] = True
-            set_step(agent, "search", "failed")
-            log(agent, "site refuses non-browser clients — not bypassing")
-            return
-        set_step(agent, "search", "completed")
 
-        # 2. locate a product page
-        set_step(agent, "locate", "running")
-        m = re.search(site["link"], resp.text)
-        if not m:
-            agent["error"] = "no product link found in search results"
-            set_step(agent, "locate", "failed")
-            return
-        product_url = urllib.parse.urljoin(str(resp.url), m.group(0))
-        agent["product_url"] = product_url
-        log(agent, f"product: {product_url}")
-        try:
-            prod = await client.get(product_url)
-        except httpx.HTTPError as e:
-            agent["error"] = f"network error: {e.__class__.__name__}"
-            set_step(agent, "locate", "failed")
-            return
-        if prod.status_code >= 400:
-            agent["error"] = f"product page HTTP {prod.status_code}"
-            agent["blocked"] = prod.status_code in (403, 429, 503)
-            set_step(agent, "locate", "failed")
-            return
-        set_step(agent, "locate", "completed")
+    # 1. search
+    set_step(agent, "search", "running")
+    try:
+        search = await fetch_page(agent, site["search"].format(q=q))
+    except Exception as e:
+        agent["error"] = f"search fetch failed: {e.__class__.__name__}"
+        set_step(agent, "search", "failed")
+        return
+    if search["blocked"]:
+        agent["error"] = f"blocked by {site['name']} (HTTP {search['status']})"
+        agent["blocked"] = True
+        set_step(agent, "search", "failed")
+        log(agent, "site refuses automated clients — not bypassing")
+        return
+    set_step(agent, "search", "completed")
 
-        # 3. parse reviews
-        set_step(agent, "parse", "running")
-        reviews = extract_reviews(prod.text)
+    # 2. locate a product page
+    set_step(agent, "locate", "running")
+    m = re.search(site["link"], search["html"])
+    if not m:
+        agent["error"] = "no product link found in search results"
+        set_step(agent, "locate", "failed")
+        return
+    product_url = urllib.parse.urljoin(search["url"], m.group(0))
+    agent["product_url"] = product_url
+    try:
+        prod = await fetch_page(agent, product_url)
+    except Exception as e:
+        agent["error"] = f"product fetch failed: {e.__class__.__name__}"
+        set_step(agent, "locate", "failed")
+        return
+    if prod["blocked"] or prod["status"] >= 400:
+        agent["error"] = f"product page HTTP {prod['status']}"
+        agent["blocked"] = prod["blocked"]
+        set_step(agent, "locate", "failed")
+        return
+    set_step(agent, "locate", "completed")
+
+    # 3. parse reviews: structured data first, then Claude on the page text
+    set_step(agent, "parse", "running")
+    reviews = extract_jsonld_reviews(prod["html"])
+    if reviews:
         log(agent, f"{len(reviews)} reviews in structured data")
-        agent["reviews"] = reviews
-        set_step(agent, "parse", "completed" if reviews else "failed")
-        if not reviews:
-            agent["error"] = "page exposes no structured review data"
-            return
+    elif claude:
+        reviews = await claude_extract_reviews(agent, prod["text"])
+        log(agent, f"Claude extracted {len(reviews)} reviews")
+    agent["reviews"] = reviews
+    set_step(agent, "parse", "completed" if reviews else "failed")
+    if not reviews:
+        agent["error"] = ("no structured review data" if not claude
+                          else "no reviews found on page")
+        return
 
-    # 4. match friends
+    # 4. match friends + interest similarity
     set_step(agent, "match", "running")
     for r in agent["reviews"]:
         r["friend"] = is_friend(r["author"], friends)
     agent["matches"] = sum(1 for r in agent["reviews"] if r["friend"])
     log(agent, f"{agent['matches']} friend match(es)")
+    if claude and interests.strip():
+        await claude_score_similarity(agent, agent["reviews"], interests)
     set_step(agent, "match", "completed")
 
 
-async def demo_agent(agent: dict, site: dict, friends: list[str]):
+async def demo_agent(agent: dict, site: dict, friends: list[str], interests: str):
     """Simulated worker so the swarm UI can be exercised without live scraping."""
     rng = random.Random()
     for step in STEPS:
@@ -251,6 +433,9 @@ async def demo_agent(agent: dict, site: dict, friends: list[str]):
         if step == "match":
             for r in agent["reviews"]:
                 r["friend"] = is_friend(r["author"], friends)
+                if interests.strip() and random.random() < 0.3:
+                    r["similarity"] = rng.randint(60, 97)
+                    r["sim_reason"] = "shares your priorities (simulated)"
             agent["matches"] = sum(1 for r in agent["reviews"] if r["friend"])
             log(agent, f"{agent['matches']} friend match(es)")
         set_step(agent, step, "completed")
@@ -267,6 +452,7 @@ def compute_stats() -> dict:
         "failed": sum(1 for a in vals if a["status"] == "failed"),
         "reviews": sum(len(a["reviews"]) for a in vals),
         "matches": sum(a.get("matches", 0) for a in vals),
+        "similar": sum(1 for a in vals for r in a["reviews"] if r.get("similarity", 0) >= 70),
     }
 
 
@@ -275,6 +461,7 @@ def compute_stats() -> dict:
 class RunRequest(BaseModel):
     product: str
     friends: list[str] = []
+    interests: str = ""
     demo: bool = False
 
 
@@ -292,8 +479,14 @@ async def start_run(req: RunRequest):
     bus.publish({"type": "run", "run": run_info, "agents": list(agents.values()),
                  "stats": compute_stats()})
     for site in SITES:
-        asyncio.create_task(run_agent(site, req.product, req.friends, req.demo))
+        asyncio.create_task(run_agent(site, req.product, req.friends, req.interests, req.demo))
     return {"ok": True, "agents": len(agents)}
+
+
+@app.get("/api/config")
+async def config():
+    return {"claude": claude is not None, "playwright": HAS_PLAYWRIGHT,
+            "model": CLAUDE_MODEL if claude else None}
 
 
 @app.get("/api/state")

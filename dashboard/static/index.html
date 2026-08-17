@@ -92,7 +92,7 @@
   button.deploy:disabled { opacity: .5; cursor: default; transform: none; }
 
   /* Stats bar */
-  .stats { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-bottom: 16px; }
+  .stats { display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; margin-bottom: 16px; }
   .stat { padding: 10px 14px; text-align: center; }
   .stat .num { font-size: 20px; font-weight: 800; color: var(--primary-light); font-variant-numeric: tabular-nums; }
   .stat .lbl { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-top: 2px; }
@@ -153,6 +153,15 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
 
+  .badge.sim { background: rgba(232,163,23,.18); color: var(--warning); }
+  .banner {
+    display: flex; gap: 10px; align-items: center; padding: 10px 14px; margin-bottom: 16px;
+    font-size: 12px; color: var(--muted);
+  }
+  .banner .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .banner .on { background: var(--success); } .banner .off { background: var(--error); }
+  .banner code { background: var(--surface-2); padding: 1px 6px; border-radius: 6px; color: var(--wax, #f5deb3); }
+
   .empty { text-align: center; color: var(--muted); padding: 70px 20px; font-size: 14px; }
   .empty .hex-logo { animation: none; opacity: .35; margin-bottom: 12px; }
 
@@ -208,9 +217,12 @@
   <div class="glass controls">
     <input id="product" type="text" placeholder="Product to hunt (e.g. echo dot)" value="echo dot">
     <input id="friends" type="text" placeholder="Friends, comma-separated (e.g. Charlie, Aarsh)">
+    <input id="interests" type="text" placeholder="Your interests (e.g. durability, hiking, budget picks)" style="flex:2 1 280px">
     <label class="demo-toggle"><input id="demo" type="checkbox" checked> demo mode</label>
     <button class="deploy" id="deploy">DEPLOY SWARM</button>
   </div>
+
+  <div class="glass banner" id="banner" style="display:none"></div>
 
   <div class="stats">
     <div class="glass stat"><div class="num" id="s-total">0</div><div class="lbl">Agents</div></div>
@@ -219,6 +231,7 @@
     <div class="glass stat"><div class="num" id="s-failed">0</div><div class="lbl">Failed</div></div>
     <div class="glass stat"><div class="num" id="s-reviews">0</div><div class="lbl">Reviews</div></div>
     <div class="glass stat match"><div class="num" id="s-matches">0</div><div class="lbl">Friend hits</div></div>
+    <div class="glass stat"><div class="num" id="s-similar" style="color:var(--warning)">0</div><div class="lbl">Kindred</div></div>
   </div>
 
   <div class="grid" id="grid">
@@ -262,6 +275,8 @@ function chipHtml(a) {
 function cardHtml(a) {
   const badges = [];
   if (a.matches > 0) badges.push(`<span class="badge match">${a.matches} friend${a.matches > 1 ? "s" : ""}</span>`);
+  const kindred = a.reviews.filter(r => (r.similarity ?? 0) >= 70).length;
+  if (kindred > 0) badges.push(`<span class="badge sim">${kindred} kindred</span>`);
   if (a.blocked) badges.push('<span class="badge blocked">blocked</span>');
   else if (a.status === "queued") badges.push('<span class="badge">queued</span>');
   const meta = a.error
@@ -307,8 +322,10 @@ function renderDrawer(a) {
     ${a.reviews.map(r => `
       <div class="review ${r.friend ? "friend" : ""}">
         <div class="who">${esc(r.author)} ${r.friend ? '<span class="fbadge">friend</span>' : ""}
+          ${(r.similarity ?? 0) >= 70 ? `<span class="badge sim">${r.similarity}% kindred</span>` : ""}
           <span class="stars">${stars(r.rating)}</span></div>
         <p>${esc(r.text)}</p>
+        ${r.sim_reason ? `<p style="color:var(--warning);font-size:10px;margin-top:4px">↳ ${esc(r.sim_reason)}</p>` : ""}
       </div>`).join("") || '<p style="color:var(--muted);font-size:12px">nothing parsed yet</p>'}`;
   document.getElementById("close-btn").addEventListener("click", closeDrawer);
 }
@@ -330,7 +347,7 @@ $("overlay").addEventListener("click", closeDrawer);
 
 function setStats(s) {
   if (!s) return;
-  for (const k of ["total", "running", "completed", "failed", "reviews", "matches"])
+  for (const k of ["total", "running", "completed", "failed", "reviews", "matches", "similar"])
     $("s-" + k).textContent = s[k] ?? 0;
 }
 function recount() {
@@ -342,8 +359,21 @@ function recount() {
     failed: vals.filter(a => a.status === "failed").length,
     reviews: vals.reduce((n, a) => n + a.reviews.length, 0),
     matches: vals.reduce((n, a) => n + (a.matches || 0), 0),
+    similar: vals.reduce((n, a) => n + a.reviews.filter(r => (r.similarity ?? 0) >= 70).length, 0),
   });
 }
+
+fetch("/api/config").then(r => r.json()).then(cfg => {
+  const b = $("banner");
+  b.style.display = "flex";
+  b.innerHTML = `
+    <span class="dot ${cfg.playwright ? "on" : "off"}"></span> browser engine ${cfg.playwright ? "ready (Chromium)" : "missing — <code>pip install playwright && playwright install chromium</code>"}
+    <span style="opacity:.3">|</span>
+    <span class="dot ${cfg.claude ? "on" : "off"}"></span>
+    ${cfg.claude
+      ? `Claude connected (<code>${cfg.model}</code>) — AI extraction + interest matching active`
+      : `Claude offline — Charlie: copy <code>dashboard/.env.example</code> to <code>dashboard/.env</code> and add your <code>ANTHROPIC_API_KEY</code>, then restart the server`}`;
+});
 
 const es = new EventSource("/api/events");
 es.onmessage = (e) => {
@@ -371,6 +401,7 @@ $("deploy").addEventListener("click", async () => {
       body: JSON.stringify({
         product,
         friends: $("friends").value.split(",").map(s => s.trim()).filter(Boolean),
+        interests: $("interests").value.trim(),
         demo: $("demo").checked,
       }),
     });
